@@ -1,0 +1,152 @@
+#!/usr/bin/env escript
+-mode(compile).
+
+%%% decomp - decompress a State of Decay 2 save file.
+%%% Copyright (C) 2021  Matthew Gill
+%%%
+%%% This program is free software; you can redistribute it and/or modify
+%%% it under the terms of the GNU General Public License as published by
+%%% the Free Software Foundation; either version 2 of the License, or
+%%% (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%%% GNU General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+main([InFilename, OutFilename]) ->
+   {ok, Binary} = file:read_file(InFilename),
+   decompress(Binary, OutFilename);
+main(_) ->
+   usage().
+
+usage() ->
+   io:format("decomp v1.0.0~n"),
+   io:format("Decompress a compressed State of Decay 2 save file.~n~n"),
+   io:format("usage: decomp <compressed-filename> <decompressed-filename>~n"),
+   halt(1).
+
+decompress(Data, OutFilename) ->
+   check_signature(Data),
+   {CompLength, DecompLength, CompLengthOffset, PropertyBlockOffset} = extract_property_block_details(Data),
+   check_compressed_length(CompLength),
+   CompressedBlock = binary_part(Data, PropertyBlockOffset, CompLength),
+   Decompressed = decompress_sequences(CompressedBlock, <<>>),
+   NewDecompLength = byte_size(Decompressed),
+   check_decompressed_length(DecompLength, NewDecompLength),
+   io:format("Length of compressed data block: ~B bytes~n", [CompLength]),
+   io:format("Length of decompressed data block: ~B bytes~n", [DecompLength]),
+   Header = copy_header(Data, PropertyBlockOffset, CompLengthOffset),
+   Remainder = binary_part(Data, PropertyBlockOffset + CompLength, byte_size(Data) - PropertyBlockOffset - CompLength),
+   Output = <<Header/binary, Decompressed/binary, Remainder/binary>>,
+   ok = file:write_file(OutFilename, Output).
+
+check_signature(<<"GVAS", _Rest/binary>>) ->
+   ok;
+check_signature(_) ->
+   io:format("Not a GVAS file!~n"),
+   halt(1).
+
+check_compressed_length(0) ->
+   io:format("Save file is decompressed already!~n"),
+   halt(1);
+check_compressed_length(_) ->
+   ok.
+
+extract_property_block_details(Data) ->
+   <<_:22/binary, BuildIdLen:32/little, _/binary>> = Data,
+   BeforeCustomFormatDataCount = 22 + 4 + BuildIdLen + 4,
+   CustomFormatDataCountBytes = binary_part(Data, BeforeCustomFormatDataCount, 4),
+   <<CustomFormatDataCount:32/little>> = CustomFormatDataCountBytes,
+   BeforeSaveGameType = BeforeCustomFormatDataCount + 4 + CustomFormatDataCount * 20 + 4,
+   SaveTypeLenBytes = binary_part(Data, BeforeSaveGameType, 4),
+   <<SaveTypeLen:32/little>> = SaveTypeLenBytes,
+   BeforeBlockLengths = BeforeSaveGameType + 4 + SaveTypeLen + 4,
+   BlockLenBytes = binary_part(Data, BeforeBlockLengths, 8),
+   <<CompLength:32/little, DecompLength:32/little>> = BlockLenBytes,
+   BeforePropertyBlock = BeforeBlockLengths + 8,
+   {CompLength, DecompLength, BeforeBlockLengths, BeforePropertyBlock}.
+
+decompress_sequences(<<>>, Output) ->
+   Output;
+decompress_sequences(Input, Output) ->
+   {NewOutput, NewInput} = decompress_sequence(Input, Output),
+   decompress_sequences(NewInput, NewOutput).
+
+decompress_sequence(Input, Output) ->
+   {LiteralLength, MatchLength, Rest1} = get_sequence_token(Input),
+   % io:format("Bytes left of input = ~B, Bytes so far of output = ~B~n", [byte_size(Input), byte_size(Output)]),
+   % io:format("Literal length = ~B, Match length = ~B~n", [LiteralLength, MatchLength]),
+   {Literal, Rest2} = get_literal(Rest1, LiteralLength),
+   % io:format("Literal = ~w~n", [Literal]),
+   NewOutput = <<Output/binary, Literal/binary>>,
+   {Match, Rest3} = get_match(Rest2, MatchLength, NewOutput),
+   % io:format("Match = ~w~n", [Match]),
+   {<<NewOutput/binary, Match/binary>>, Rest3}.
+
+get_literal(Binary, Length) ->
+   Literal = binary_part(Binary, 0, Length),
+   Rest = binary_part(Binary, Length, byte_size(Binary) - Length),
+   {Literal, Rest}.
+
+get_match(Input, _Length, _Output) when Input =:= <<>> ->
+   {<<>>, Input};
+get_match(Input, Length, Output) ->
+   <<Offset:16/little, Rest1/binary>> = Input,
+   {FullLength, Rest2} = get_match_length(Length, Rest1),
+   % io:format("Offset = ~B, Full match length = ~B~n", [Offset, FullLength]),
+   Match = copy_match(Output, Offset, FullLength),
+   {Match, Rest2}.
+
+copy_match(Data, Offset, Length) when Offset >= Length ->
+   % No overlap, so just copy chunk.
+   binary_part(Data, byte_size(Data) - Offset, Length);
+copy_match(Data, 1, Length) ->
+   % One byte overlap, so duplicate last byte Length times.
+   LastByte = binary_part(Data, byte_size(Data) - 1, 1),
+   List = lists:duplicate(Length, LastByte),
+   list_to_binary(List);
+copy_match(Data, Offset, Length) ->
+   % Multi-byte overlap.
+   PartialMatch = binary_part(Data, byte_size(Data) - Offset, Offset),
+   copy_previous(PartialMatch, 0, Length - Offset).
+
+copy_previous(Data, N, N) ->
+   Data;
+copy_previous(Data, Offset, Length) ->
+   Byte = binary:at(Data, Offset),
+   NewData = <<Data/binary, Byte:8>>,
+   copy_previous(NewData, Offset + 1, Length).
+
+get_sequence_token(<<15:4, MatchLength:4, Rest/binary>>) ->
+   {LiteralLength, Rest1} = get_multibyte_length(Rest),
+   {LiteralLength + 15, MatchLength, Rest1};
+get_sequence_token(<<LiteralLength:4, MatchLength:4, Rest/binary>>) ->
+   {LiteralLength, MatchLength, Rest}.
+
+get_multibyte_length(<<255:8, Rest/binary>>) ->
+   {Length, Rest1} = get_multibyte_length(Rest),
+   {Length + 255, Rest1};
+get_multibyte_length(<<Length:8, Rest/binary>>) ->
+   {Length, Rest}.
+
+get_match_length(15, Binary) ->
+   {MatchLength, Rest} = get_multibyte_length(Binary),
+   {MatchLength + 15 + 4, Rest};
+get_match_length(MatchLength, Binary) ->
+   {MatchLength + 4, Binary}.
+
+check_decompressed_length(N, N) ->
+   ok;
+check_decompressed_length(ExpectedLength, ActualLength) ->
+   io:format("Expected decompressed data to be ~B bytes, but it was ~B bytes!~n", [ExpectedLength, ActualLength]).
+
+copy_header(Data, HeaderLength, CompLengthOffset) ->
+   % Return the header, except with the compressed length set to zero.
+   BeforeCompLength = binary_part(Data, 0, CompLengthOffset),
+   AfterCompLength = binary_part(Data, CompLengthOffset + 4, HeaderLength - CompLengthOffset - 4),
+   <<BeforeCompLength/binary, 0:32, AfterCompLength/binary>>.

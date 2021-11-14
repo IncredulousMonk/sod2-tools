@@ -1,0 +1,201 @@
+#!/usr/bin/env escript
+-mode(compile).
+
+%%% recomp - recompress a decompressed State of Decay 2 save file.
+%%% Copyright (C) 2021  Matthew Gill
+%%%
+%%% This program is free software; you can redistribute it and/or modify
+%%% it under the terms of the GNU General Public License as published by
+%%% the Free Software Foundation; either version 2 of the License, or
+%%% (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%%% GNU General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+main([InFilename, OutFilename]) ->
+   {ok, Binary} = file:read_file(InFilename),
+   compress(Binary, OutFilename);
+main(_) ->
+   usage().
+
+usage() ->
+   io:format("recomp v1.0.0~n"),
+   io:format("Recompress a previously decompressed State of Decay 2 save file.~n~n"),
+   io:format("usage: recomp <uncompressed-filename> <compressed-filename>~n"),
+   halt(1).
+
+compress(Data, OutFilename) ->
+   check_signature(Data),
+   {CompLength, DecompLength, CompLengthOffset, PropertyBlockOffset} = extract_property_block_details(Data),
+   check_compressed_length(CompLength),
+   Compressed = compress_property_block(Data, PropertyBlockOffset, DecompLength),
+   NewCompLength = byte_size(Compressed),
+   io:format("Length of uncompressed data block: ~B bytes~n", [DecompLength]),
+   io:format("Length of compressed data block: ~B bytes~n", [NewCompLength]),
+   Header = copy_header(Data, PropertyBlockOffset, CompLengthOffset, NewCompLength),
+   Remainder = binary_part(Data, PropertyBlockOffset + DecompLength, byte_size(Data) - PropertyBlockOffset - DecompLength),
+   Output = <<Header/binary, Compressed/binary, Remainder/binary>>,
+   ok = file:write_file(OutFilename, Output).
+
+check_signature(<<"GVAS", _Rest/binary>>) ->
+   ok;
+check_signature(_) ->
+   io:format("Not a GVAS file!~n"),
+   halt(1).
+
+check_compressed_length(0) ->
+   ok;
+check_compressed_length(_) ->
+   io:format("Save file is compressed already!~n"),
+   halt(1).
+
+extract_property_block_details(Data) ->
+   <<_:22/binary, BuildIdLen:32/little, _/binary>> = Data,
+   BeforeCustomFormatDataCount = 22 + 4 + BuildIdLen + 4,
+   CustomFormatDataCountBytes = binary_part(Data, BeforeCustomFormatDataCount, 4),
+   <<CustomFormatDataCount:32/little>> = CustomFormatDataCountBytes,
+   BeforeSaveGameType = BeforeCustomFormatDataCount + 4 + CustomFormatDataCount * 20 + 4,
+   SaveTypeLenBytes = binary_part(Data, BeforeSaveGameType, 4),
+   <<SaveTypeLen:32/little>> = SaveTypeLenBytes,
+   BeforeBlockLengths = BeforeSaveGameType + 4 + SaveTypeLen + 4,
+   BlockLenBytes = binary_part(Data, BeforeBlockLengths, 8),
+   <<CompLength:32/little, DecompLength:32/little>> = BlockLenBytes,
+   BeforePropertyBlock = BeforeBlockLengths + 8,
+   {CompLength, DecompLength, BeforeBlockLengths, BeforePropertyBlock}.
+
+compress_property_block(Data, BlockOffset, BlockLength) ->
+   PropertyBlock = binary_part(Data, BlockOffset, BlockLength),
+   Prefixes = #{},
+   compress_property_block(PropertyBlock, Prefixes).
+
+compress_property_block(Block, Prefixes) ->
+   <<Window:32/little, _/binary>> = Block,
+   create_sequence(#{
+      block => Block, % The full block of uncompressed data.
+      blocklen => byte_size(Block), % The number of bytes in the block.
+      prefixes => Prefixes, % The map of prefixes (map from 4-byte window to location within the block).
+      window => Window, % The current 4-byte window.
+      offset => 0, % The offset of window from the start of the block.
+      seqstart => 0, % The offset of the start of the current sequence.
+      output => <<>> % The output (compressed) block.
+   }).
+
+create_sequence(#{blocklen := BlockLen, prefixes := Prefixes, window := Window, offset := Offset} = State) when is_map_key(Window, Prefixes), BlockLen - Offset >= 9 ->
+   % We have a match that isn't too close to the end of the block.
+   % Check that the match distance will fit into two bytes.
+   #{Window := Address} = Prefixes,
+   MatchOffset = Offset - Address,
+   NewState = 
+      if MatchOffset < 65536 -> create_match(State);
+         MatchOffset >= 65536 -> store_prefix(State)
+      end,
+   create_sequence(NewState);
+create_sequence(#{blocklen := BlockLen, offset := Offset} = State) when BlockLen - Offset < 9 ->
+   % The specification says that "The last 5 bytes of input are always literals".
+   % We have to stop if there are less than 9 characters left, because the minimum match is 4 bytes.
+   #{block := Block, seqstart := SeqStart, output := Output} = State,
+   Literal = binary_part(Block, SeqStart, BlockLen - SeqStart),
+   Token = create_sequence_token(byte_size(Literal), 4),
+   Sequence = <<Token/binary, Literal/binary>>,
+   % io:format("Sequence = ~w~n", [Sequence]),
+   <<Output/binary, Sequence/binary>>;
+create_sequence(State) ->
+   % The current window doesn't exist in the prefix map, so store it.
+   NewState = store_prefix(State),
+   create_sequence(NewState).
+
+create_match(State) ->
+   #{
+      block := Block,
+      blocklen := BlockLen,
+      prefixes := Prefixes,
+      window := Window,
+      offset := Offset,
+      seqstart := SeqStart,
+      output := Output
+   } = State,
+   #{Window := Address} = Prefixes,
+   Literal = binary_part(Block, SeqStart, Offset - SeqStart),
+   MatchOffset = Offset - Address,
+   OffsetBytes = <<MatchOffset:16/little>>,
+   % io:format("Bytes so far of input = ~B, Bytes so far of output = ~B~n", [SeqStart, byte_size(Output)]),
+   % io:format("Found prefix ~.16b at address: ~B (Offset = ~B, MatchOffset = ~B)~n", [Window, Address, Offset, MatchOffset]),
+   Len = longest_match_length(Block, Address, Offset, BlockLen),
+   Token = create_sequence_token(byte_size(Literal), Len),
+   MatchLengthExtensionBytes = create_match_extension_bytes(Len),
+   % io:format("Longest match = ~B~n", [Len]),
+   % io:format("Literal = ~w (~B bytes)~n", [Literal, byte_size(Literal)]),
+   % io:format("Match = ~w~n", [binary_part(Block, Address, Len)]),
+   % io:format("Offset bytes = ~w~n", [OffsetBytes]),
+   % io:format("Sequence token = ~w~n", [Token]),
+   Sequence = <<Token/binary, Literal/binary, OffsetBytes/binary, MatchLengthExtensionBytes/binary>>,
+   % io:format("Sequence = ~w~n~n", [Sequence]),
+   NewPrefixes = Prefixes#{Window => Offset},
+   NewOffset = Offset + Len,
+   Subset = binary_part(Block, NewOffset, 4),
+   <<NewWindow:32/little>> = Subset,
+   NewOutput = <<Output/binary, Sequence/binary>>,
+   State#{
+      prefixes := NewPrefixes,
+      window := NewWindow,
+      offset := NewOffset,
+      seqstart := SeqStart + byte_size(Literal) + Len,
+      output := NewOutput
+   }.
+
+store_prefix(State) ->
+   #{block := Block, prefixes := Prefixes, window := Window, offset := Offset} = State,
+   NewPrefixes = Prefixes#{Window => Offset},
+   Subset = binary_part(Block, Offset + 1, 4),
+   <<NewWindow:32/little>> = Subset,
+   State#{prefixes := NewPrefixes, window := NewWindow, offset := Offset + 1}.
+
+longest_match_length(Block, Address, Offset, BlockLen) ->
+   longest_match_length(Block, Address, Offset, BlockLen, 4).
+
+longest_match_length(_, _, Offset, BlockLen, Length) when BlockLen - Offset - Length < 6 ->
+   % Stop matching if we reach 5 characters from end of block.
+   Length;
+longest_match_length(Block, Address, Offset, BlockLen, Length) ->
+   Str1 = binary_part(Block, Address, Length),
+   Str2 = binary_part(Block, Offset, Length),
+   if Str1 =:= Str2 -> longest_match_length(Block, Address, Offset, BlockLen, Length + 1);
+      Str1 =/= Str2 -> Length - 1
+   end.
+
+create_sequence_token(LiteralLength, MatchLength) when LiteralLength < 15, MatchLength < 19 ->
+   EncodedMatchLength = MatchLength - 4,
+   <<LiteralLength:4, EncodedMatchLength:4>>;
+create_sequence_token(LiteralLength, MatchLength) when LiteralLength < 15, MatchLength >= 19 ->
+   <<LiteralLength:4, 15:4>>;
+create_sequence_token(LiteralLength, MatchLength) when LiteralLength >= 15, MatchLength < 19 ->
+   EncodedMatchLength = MatchLength - 4,
+   ExtensionBytes = create_extension_bytes(LiteralLength - 15),
+   <<15:4, EncodedMatchLength:4, ExtensionBytes/binary>>;
+create_sequence_token(LiteralLength, MatchLength) when LiteralLength >= 15, MatchLength >= 19 ->
+   ExtensionBytes = create_extension_bytes(LiteralLength - 15),
+   <<15:4, 15:4, ExtensionBytes/binary>>.
+
+create_match_extension_bytes(MatchLength) when MatchLength < 19 ->
+   <<>>;
+create_match_extension_bytes(MatchLength) ->
+   create_extension_bytes(MatchLength - 19).
+
+create_extension_bytes(Length) when Length < 255 ->
+   <<Length:8>>;
+create_extension_bytes(Length) ->
+   ExtraLength = create_extension_bytes(Length - 255),
+   <<255:8, ExtraLength/binary>>.
+
+copy_header(Data, HeaderLength, CompLengthOffset, CompLength) ->
+   % Return the header, except with the compressed length overwritten.
+   BeforeCompLength = binary_part(Data, 0, CompLengthOffset),
+   EncodedCompLength = <<CompLength:32/little>>,
+   AfterCompLength = binary_part(Data, CompLengthOffset + 4, HeaderLength - CompLengthOffset - 4),
+   <<BeforeCompLength/binary, EncodedCompLength/binary, AfterCompLength/binary>>.
