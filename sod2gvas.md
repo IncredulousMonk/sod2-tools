@@ -39,15 +39,17 @@ This information is very much a work in progress, but these are the property typ
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | *4 bytes* | "None" | *4 bytes* (0) |
 | *4 bytes* | *Name* | *4 bytes* (12) | "StrProperty" | *8 bytes* | *1 null byte* | | | | *String* |
+| *4 bytes* | *Name* | *4 bytes* (13) | "NameProperty" | *8 bytes* | *1 null byte* | | | | *String* |
 | *4 bytes* | *Name* | *4 bytes* (12) | "IntProperty" | *8 bytes* (4) | *1 null byte* | | | | *Int32* |
+| *4 bytes* | *Name* | *4 bytes* (14) | "FloatProperty" | *8 bytes* (4) | *1 null byte* | | | | *Float* |
 | *4 bytes* | *Name* | *4 bytes* (15) | "DoubleProperty" | *8 bytes* (8) | *1 null byte* | | | | *Double* |
 | *4 bytes* | *Name* | *4 bytes* (13) | "BoolProperty" | *8 bytes* (0) | | | | | *Int16* |
 | *4 bytes* | *Name* | *4 bytes* (13) | "TextProperty" | *8 bytes* | *1 null byte* | | | | *Multiple strings* |
 
-### Array properties
-| Name length | Name | Type length | Type | Element count | Element type length | Element type | Padding? | Value |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| *4 bytes* | *Name* | *4 bytes* (14) | "ArrayProperty" | *8 bytes* | *4 bytes* | *Type name* | *1 null byte* | *Elements* |
+### Array of simple properties
+| Name length | Name | Type length | Type | Data length | Element type length | Element type | Padding? | Element count | Value |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| *4 bytes* | *Name* | *4 bytes* (14) | "ArrayProperty" | *8 bytes* | *4 bytes* | *Type name* | *1 null byte* | *4 bytes* | *Elements* |
 
 ### Structure properties
 | Name length | Name | Type length | Type | Data length | Padding? | Struct type length | Struct type | Padding? | Value |
