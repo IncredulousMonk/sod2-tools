@@ -1,0 +1,206 @@
+#!/usr/bin/env escript
+-mode(compile).
+
+%%% savedump - dump a decompressed State of Decay 2 save file in a somewhat readable format.
+%%% Copyright (C) 2021  Matthew Gill
+%%%
+%%% This program is free software; you can redistribute it and/or modify
+%%% it under the terms of the GNU General Public License as published by
+%%% the Free Software Foundation; either version 2 of the License, or
+%%% (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%%% GNU General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+%%% This is *alpha* software, still under development.
+%%% It runs without errors (at least on my save files), but currently it
+%%% skims over most of the interesting structures.
+
+main([InFilename]) ->
+   {ok, Binary} = file:read_file(InFilename),
+   dump_save(Binary);
+main(_) ->
+   usage().
+
+usage() ->
+   io:format("savedump v1.0.0 [alpha]~n"),
+   io:format("Dump the contents of an uncompressed State of Decay 2 save file in a somewhat readable format.~n~n"),
+   io:format("usage: savedump <uncompressed-save-filename>~n"),
+   halt(1).
+
+dump_save(Data) ->
+   check_signature(Data),
+   {CompLength, UncompLength, Offset, Rest} = dump_header(Data),
+   check_compressed_length(CompLength),
+   FooterOffset = dump_properties(binary_part(Rest, 0, UncompLength), Offset),
+   io:format("[~6.16.0b] *Footer data*~n", [FooterOffset]).
+   % Dump remaining data?
+
+check_signature(<<"GVAS", _Rest/binary>>) ->
+   ok;
+check_signature(_) ->
+   io:format("Not a GVAS file!~n"),
+   halt(1).
+
+check_compressed_length(0) ->
+   ok;
+check_compressed_length(_) ->
+   io:format("Save file is compressed!  Please decompress the file first.~n"),
+   halt(1).
+
+dump_header(Data) ->
+   <<Signature:32, SaveVersion:32/little, PackageVersion:32/little,
+      EngineMajor:16/little, EngineMinor:16/little, EnginePatch:16/little, EngineBuild:32/little,
+      Rest1/binary>> = Data,
+   {BuildId, BuildIdLen, Rest2} = get_lzstring(Rest1),
+   <<CustomFormatVersion:32/little, CustomFormatDataCount:32/little, Rest3/binary>> = Rest2,
+   io:format("[~6.16.0b] Signature: ~.16+~n", [0, Signature]),
+   io:format("[~6.16.0b] Save version: ~B~n", [4, SaveVersion]),
+   io:format("[~6.16.0b] Package version: ~B~n", [8, PackageVersion]),
+   io:format("[~6.16.0b] Engine version: ~B.~B.~B.~B~n", [12, EngineMajor, EngineMinor, EnginePatch, EngineBuild]),
+   io:format("[~6.16.0b] Build ID: ~s~n", [22, BuildId]),
+   io:format("[~6.16.0b] Custom format version: ~B~n", [22 + BuildIdLen, CustomFormatVersion]),
+   io:format("[~6.16.0b] Custom format data count: ~B~n", [22 + BuildIdLen + 4, CustomFormatDataCount]),
+   Rest4 = dump_custom_format_block(Rest3, 1, CustomFormatDataCount, 22 + BuildIdLen + 8),
+   EndOfCustomDataOffset = 22 + BuildIdLen + 8 + CustomFormatDataCount * 20,
+   <<Unknown1:32/little, Rest5/binary>> = Rest4,
+   io:format("[~6.16.0b] Unknown value 1: ~.16+~n", [EndOfCustomDataOffset, Unknown1]),
+   {SaveGameType, SaveTypeLen, Rest6} = get_lzstring(Rest5),
+   io:format("[~6.16.0b] Save game type: ~s~n", [EndOfCustomDataOffset + 4, SaveGameType]),
+   AfterSaveTypeOffset = EndOfCustomDataOffset + 4 + SaveTypeLen,
+   <<Unknown2:32/little, CompLength:32/little, UncompLength:32/little, Rest7/binary>> = Rest6,
+   io:format("[~6.16.0b] Unknown value 2: ~.16+~n", [AfterSaveTypeOffset, Unknown2]),
+   io:format("[~6.16.0b] Length of compressed data: ~B bytes~n", [AfterSaveTypeOffset + 4, CompLength]),
+   io:format("[~6.16.0b] Length of uncompressed data: ~B bytes~n", [AfterSaveTypeOffset + 8, UncompLength]),
+   {CompLength, UncompLength, AfterSaveTypeOffset + 12, Rest7}.
+
+dump_properties(<<>>, Offset) ->
+   Offset;
+dump_properties(Data, Offset) ->
+   {PropertyLength, Rest} = dump_property(Data, Offset),
+   dump_properties(Rest, Offset + PropertyLength).
+
+dump_property(Data, Offset) ->
+   {Name, Type, Value, Length, Rest} = get_property(Data),
+   io:format("[~6.16.0b] Property: ~s (~s) = ~s~n", [Offset, Name, Type, Value]),
+   {Length, Rest}.
+
+get_lzstring(Binary) ->
+   <<Length:32/little, Rest/binary>> = Binary,
+   get_lzstring_contents(Rest, Length).
+
+get_lzstring_contents(Binary, 0) ->
+   % If length is zero then we still have to skip the null byte.
+   Rest = binary_part(Binary, 1, byte_size(Binary) - 1),
+   {<<>>, 5, Rest};
+get_lzstring_contents(Binary, Length) ->
+   String = binary_part(Binary, 0, Length - 1),
+   Rest = binary_part(Binary, Length, byte_size(Binary) - Length),
+   {String, Length + 4, Rest}.
+
+dump_custom_format_block(Binary, N, N, Offset) ->
+   dump_custom_format_data(Binary, N, Offset);
+dump_custom_format_block(Binary, N, Count, Offset) ->
+   Rest = dump_custom_format_data(Binary, N, Offset),
+   dump_custom_format_block(Rest, N + 1, Count, Offset + 20).
+
+dump_custom_format_data(Binary, N, Offset) ->
+   <<Guid:128, Value:32/little, Rest/binary>> = Binary,
+   io:format("[~6.16.0b] Custom format data ~B: ~32.16.0b = ~B~n", [Offset, N, Guid, Value]),
+   Rest.
+
+get_property(Binary) ->
+   {Name, NameLen, Rest1} = get_lzstring(Binary),
+   {Type, TypeLen, Rest2} = get_property_type(Name, Rest1),
+   {Value, ValueLen, Rest3} = get_property_value(Type, Rest2),
+   {Name, Type, Value, NameLen + TypeLen + ValueLen, Rest3}.
+
+get_property_type(<<"None">>, Binary) ->
+   <<_Type:32, Rest/binary>> = Binary, % Zero-length string
+   {<<"Terminator">>, 4, Rest};
+get_property_type(_, Binary) ->
+   get_lzstring(Binary).
+
+get_property_value(<<"Terminator">>, Binary) ->
+   {<<"NONE!">>, 0, Binary};
+get_property_value(<<"StrProperty">>, Binary) ->
+   <<_DataLength:64, 0:8, Rest1/binary>> = Binary,
+   {String, Length, Rest2} = get_lzstring(Rest1),
+   {String, Length + 9, Rest2};
+get_property_value(<<"IntProperty">>, Binary) ->
+   <<_DataLength:64, 0:8, Value:32/little, Rest/binary>> = Binary,
+   {iolist_to_binary(io_lib:format("~B", [Value])), 13, Rest};
+get_property_value(<<"BoolProperty">>, Binary) ->
+   <<_DataLength:64, Value:16/little, Rest/binary>> = Binary,
+   {iolist_to_binary(io_lib:format("~B", [Value])), 10, Rest};
+get_property_value(<<"DoubleProperty">>, Binary) ->
+   <<_DataLength:64, 0:8, Value:64/float-little, Rest/binary>> = Binary,
+   {iolist_to_binary(io_lib:format("~f", [Value])), 17, Rest};
+get_property_value(<<"TextProperty">>, Binary) ->
+   <<DataLength:64/little, 0:8, Rest1/binary>> = Binary,
+   {TextList, Rest2} = get_text_property_value(Rest1, DataLength),
+   QuotedList = lists:map(fun(S) -> <<"\"", S/binary, "\"">> end, TextList),
+   SeparatedList = lists:join(<<", ">>, QuotedList),
+   {SeparatedList, DataLength + 9, Rest2};
+get_property_value(<<"StructProperty">>, Binary) ->
+   <<DataLength:64/little, Rest1/binary>> = Binary,
+   {StructType, TypeLen, Rest2} = get_lzstring(Rest1),
+   {StructValue, ValueLen, Rest3} = get_struct_value(StructType, DataLength, Rest2),
+   Sep = <<": ">>,
+   {<<StructType/binary, Sep/binary, StructValue/binary>>, TypeLen + ValueLen + 8, Rest3};
+get_property_value(<<"MapProperty">>, Binary) ->
+   <<DataLength:64/little, 0:40, Count:32/little, Rest1/binary>> = Binary,
+   ContentsLength = DataLength - 8, % DataLength includes Count and 4 of the null bytes.
+   <<_Contents:ContentsLength/binary, Rest2/binary>> = Rest1,
+   Value = iolist_to_binary(io_lib:format("Map containing ~B elements", [Count])),
+   {Value, DataLength + 9, Rest2};
+get_property_value(<<"ArrayProperty">>, Binary) ->
+   <<DataLength:64/little, Rest1/binary>> = Binary,
+   {ElementType, TypeLen, Rest2} = get_lzstring(Rest1),
+   <<0:8, Count:32/little, Rest3/binary>> = Rest2,
+   {Value, Rest4} = get_array_value(ElementType, DataLength, Count, Rest3),
+   {Value, TypeLen + DataLength + 9, Rest4}.
+
+get_struct_value(<<"Guid">>, _DataLength, Binary) ->
+   <<_Padding:136, Guid:16/binary, Rest/binary>> = Binary,
+   {guid_to_string(Guid), 17 + 16, Rest};
+get_struct_value(<<"DateTime">>, _DataLength, Binary) ->
+   <<_Padding:136, DateTime:8/binary, Rest/binary>> = Binary,
+   {datetime_to_string(DateTime), 17 + 8, Rest};
+get_struct_value(_, DataLength, Binary) ->
+   <<_Padding:136, _Value:DataLength/binary, Rest/binary>> = Binary,
+   {unknown_struct_to_string(DataLength), 17 + DataLength, Rest}.
+
+get_array_value(<<"ByteProperty">>, _DataLength, ElementCount, Binary) ->
+   <<Bytes:ElementCount/binary, Rest/binary>> = Binary,
+   {bytes_to_string(Bytes), Rest}.
+
+guid_to_string(<<A:32, B:32, C:32, D:32>>) ->
+   iolist_to_binary(io_lib:format("~8.16.0b~8.16.0b~8.16.0b~8.16.0b", [A, B, C, D])).
+
+datetime_to_string(<<DateTime:64>>) ->
+   iolist_to_binary(io_lib:format("~16.16.0b", [DateTime])).
+
+unknown_struct_to_string(DataLength) ->
+   iolist_to_binary(io_lib:format("? (~B bytes)", [DataLength])).
+
+bytes_to_string(Bytes) ->
+   List = binary_to_list(Bytes),
+   Hex = lists:map(fun(X) -> io_lib:format("~2.16.0b", [X]) end, List),
+   iolist_to_binary(lists:join(<<", ">>, Hex)).
+
+get_text_property_value(Binary, Length) ->
+   get_text_property_value(Binary, [], 0, Length).
+
+get_text_property_value(Binary, TextList, TotalLength, TotalLength) ->
+   {lists:reverse(TextList), Binary};
+get_text_property_value(Binary, TextList, CurrentLength, TotalLength) ->
+   {String, Size, Rest} = get_lzstring(Binary),
+   NewTextList = [String | TextList],
+   get_text_property_value(Rest, NewTextList, CurrentLength + Size, TotalLength).
