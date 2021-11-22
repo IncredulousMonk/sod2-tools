@@ -37,19 +37,46 @@ This information is very much a work in progress, but these are the property typ
 ### Simple properties
 | Name length | Name | Type length | Type | Data length | Padding? | Struct type length | Struct type | Padding? | Value |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| *4 bytes* | "None" | *4 bytes* (0) |
+| *4 bytes* | "None" | |
 | *4 bytes* | *Name* | *4 bytes* (12) | "StrProperty" | *8 bytes* | *1 null byte* | | | | *String* |
 | *4 bytes* | *Name* | *4 bytes* (13) | "NameProperty" | *8 bytes* | *1 null byte* | | | | *String* |
+| *4 bytes* | *Name* | *4 bytes* (13) | "AssetObjectProperty" | *8 bytes* | *1 null byte* | | | | *String* |
 | *4 bytes* | *Name* | *4 bytes* (12) | "IntProperty" | *8 bytes* (4) | *1 null byte* | | | | *Int32* |
+| *4 bytes* | *Name* | *4 bytes* (12) | "UInt32Property" | *8 bytes* (4) | *1 null byte* | | | | *UInt32* |
 | *4 bytes* | *Name* | *4 bytes* (14) | "FloatProperty" | *8 bytes* (4) | *1 null byte* | | | | *Float* |
 | *4 bytes* | *Name* | *4 bytes* (15) | "DoubleProperty" | *8 bytes* (8) | *1 null byte* | | | | *Double* |
 | *4 bytes* | *Name* | *4 bytes* (13) | "BoolProperty" | *8 bytes* (0) | | | | | *Int16* |
 | *4 bytes* | *Name* | *4 bytes* (13) | "TextProperty" | *8 bytes* | *1 null byte* | | | | *Multiple strings* |
 
+StrProperty, NameProperty, and AssetObjectProperty seem to be effectively synonyms.
+
 ### Array of simple properties
 | Name length | Name | Type length | Type | Data length | Element type length | Element type | Padding? | Element count | Value |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | *4 bytes* | *Name* | *4 bytes* (14) | "ArrayProperty" | *8 bytes* | *4 bytes* | *Type name* | *1 null byte* | *4 bytes* | *Elements* |
+
+Arrays of simple properties are stored in a packed format, so an ArrayProperty with an element type of FloatProperty will contain just 4 consecutive floats as its value.
+
+### Map properties
+| Name length | Name | Type length | Type | Data length | Padding? | Element count | Value |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| *4 bytes* | *Name* | *4 bytes* (12) | "MapProperty" | *8 bytes* | *5 null bytes* | *4 bytes* | *Elements* |
+
+The data length seems to include 4 of the null bytes, so maybe it should be 1 null byte + 4 more null bytes? Are those 4 null bytes perhaps a missing type string?
+
+I'm not sure how map typing is supposed to work. The map key seems to be a string (at least for the ones that I have examined), but the map value seems to be anything. So far I have seen map values that are:
+- 8 bytes of binary data
+- a struct
+- an array
+
+### Set properties
+| Name length | Name | Type length | Type | Data length | Padding? | Element count | Value |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| *4 bytes* | *Name* | *4 bytes* (12) | "SetProperty" | *8 bytes* | *5 null bytes* | *4 bytes* | *Elements* |
+
+As with map properties, the data length seems to include 4 of the null bytes.
+
+Are there any set types other than sets of strings?
 
 ### Structure properties
 | Name length | Name | Type length | Type | Data length | Padding? | Struct type length | Struct type | Padding? | Value |
