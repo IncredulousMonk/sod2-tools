@@ -1,0 +1,145 @@
+#!/usr/bin/env escript
+-mode(compile).
+
+%%% paklist - list the contents of a pak file.
+%%% Copyright (C) 2021  Matthew Gill
+%%%
+%%% This program is free software; you can redistribute it and/or modify
+%%% it under the terms of the GNU General Public License as published by
+%%% the Free Software Foundation; either version 2 of the License, or
+%%% (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%%% GNU General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+main([InFilename]) ->
+   case file:read_file(InFilename) of
+      {ok, Binary} -> io:format("File: ~s~n~n", [InFilename]), list_pak(Binary, all);
+      {error, Reason} -> file_error(Reason, InFilename)
+   end;
+main([InFilename, Regex]) ->
+   case file:read_file(InFilename) of
+      {ok, Binary} -> io:format("File: ~s~n~n", [InFilename]), list_pak(Binary, Regex);
+      {error, Reason} -> file_error(Reason, InFilename)
+   end;
+main(_) ->
+   usage().
+
+file_error(enoent, Filename) -> io:format("Error, \"~s\" does not exist!~n", [Filename]);
+file_error(eacces, Filename) -> io:format("Error, no permission to read file: \"~s\"!~n", [Filename]);
+file_error(eisdir, Filename) -> io:format("Error, \"~s\" is not a file!~n", [Filename]);
+file_error(enomem, Filename) -> io:format("Error, not enough memory to read file: \"~s\"~n", [Filename]).
+
+usage() ->
+   io:format("paklist v1.0.0~n"),
+   io:format("List the contents of a pak file.~n~n"),
+   io:format("usage: paklist <pak-filename> [<regex>]~n~n"),
+   io:format("<regex> is an optional regular expression used to list only matching file names.~n"),
+   halt(1).
+
+list_pak(Data, Regex) ->
+   check_file_size(byte_size(Data)),
+   check_signature(binary_part(Data, byte_size(Data) - 44, 4)),
+   MP = compile_regex(Regex),
+   {IndexOffset, IndexSize} = parse_footer(Data),
+   list_index(Data, MP, IndexOffset, IndexSize).
+
+check_file_size(N) when N > 44 ->
+   ok;
+check_file_size(_) ->
+   io:format("File is too small to be a pak file!~n"),
+   halt(1).
+
+check_signature(<<16#5A6F12E1:32/little>>) ->
+   ok;
+check_signature(<<Magic:32/little>>) ->
+   io:format("Pak file magic number does not match: ~.16b~n", [Magic]),
+   halt(1).
+
+compile_regex(all) ->
+   all;
+compile_regex(Regex) ->
+   case re:compile(Regex) of
+      {ok, MP} -> MP;
+      {error, {ErrString, Position}} ->
+         io:format("Error encountered at position ~B when compiling the regular expression: ~s~n", [Position, ErrString]),
+         halt(1)
+   end.
+
+parse_footer(Data) ->
+   Footer = binary_part(Data, byte_size(Data) - 44, 44),
+   <<_Magic:32/little, _Version:32/little, IndexOffset:64/little, IndexSize:64/little, IndexHash:20/binary>> = Footer,
+   Index = binary_part(Data, IndexOffset, IndexSize),
+   CalculatedHash = crypto:hash(sha, Index),
+   check_index_hash(IndexHash, CalculatedHash),
+   {IndexOffset, IndexSize}.
+
+check_index_hash(N, N) ->
+   ok;
+check_index_hash(_, _) ->
+   io:format("Index hash does not match!  File has been corrupted.~n"),
+   halt(1).
+
+list_index(Data, Regex, Offset, Size) ->
+   Index = binary_part(Data, Offset, Size),
+   {{lzs, MountPoint, _}, Rest1} = get_lzstring(Index),
+   io:format("Mount point: ~s~n~n", [MountPoint]),
+   <<RecordCount:32/little, Rest2/binary>> = Rest1,
+   {List, _} = list_index_record(Rest2, 1, RecordCount, []),
+   Filtered = filter_list(List, Regex),
+   Sorted = lists:sort(Filtered),
+   lists:foreach(fun(FileName) -> io:format("~s~n", [FileName]) end, Sorted).
+
+list_index_record(Data, Count, Count, Output) ->
+   list_index_record(Data, Output);
+list_index_record(Data, N, Count, Output) ->
+   {NewOutput, Rest} = list_index_record(Data, Output),
+   list_index_record(Rest, N + 1, Count, NewOutput).
+
+list_index_record(Data, Output) ->
+   {{lzs, FileName, _}, Rest1} = get_lzstring(Data),
+   NewOutput = [FileName | Output],
+   <<_DataOffset:64/little, _DataSize:64/little, _UncompressedSize:64/little, CompressionMethod:32/little, _DataHash:20/binary, Rest2/binary>> = Rest1,
+   Rest3 = skip_block(Rest2, CompressionMethod),
+   <<_EncryptionFlag:8, _BlockSize:32/little, Rest4/binary>> = Rest3,
+   {NewOutput, Rest4}.
+
+skip_block(Data, CompressionMethod) when CompressionMethod =:= 0 ->
+   Data;
+skip_block(Data, _CompressionMethod) ->
+   <<BlockCount:32/little, Rest1/binary>> = Data,
+   CBSize = BlockCount * 16,
+   <<_CompressionBlock:CBSize/binary, Rest2/binary>> = Rest1,
+   Rest2.
+
+filter_list(List, all) ->
+   List;
+filter_list(List, Regex) ->
+   lists:filter(
+      fun(Elem) ->
+         case re:run(Elem, Regex, [{capture, none}]) of
+            match -> true;
+            nomatch -> false
+         end
+      end, List).
+
+-type lzstring() :: {'lzs', binary(), pos_integer()}.
+
+-spec get_lzstring(binary()) -> lzstring().
+get_lzstring(Binary) ->
+   <<Length:32/little, Rest/binary>> = Binary,
+   get_lzstring_contents(Rest, Length).
+
+-spec get_lzstring_contents(binary(), non_neg_integer()) -> lzstring().
+get_lzstring_contents(Binary, 0) ->
+   {{lzs, <<>>, 4}, Binary};
+get_lzstring_contents(Binary, Length) ->
+   String = binary_part(Binary, 0, Length - 1),
+   Rest = binary_part(Binary, Length, byte_size(Binary) - Length),
+   {{lzs, String, Length + 4}, Rest}.
