@@ -19,13 +19,20 @@
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 main([InFilename, OutFilename]) ->
-   {ok, Binary} = file:read_file(InFilename),
-   decompress(Binary, OutFilename);
+   case file:read_file(InFilename) of
+      {ok, Binary} -> decompress(Binary, OutFilename);
+      {error, Reason} -> file_error(Reason, InFilename)
+   end;
 main(_) ->
    usage().
 
+file_error(enoent, Filename) -> io:format("Error, \"~s\" does not exist!~n", [Filename]);
+file_error(eacces, Filename) -> io:format("Error, no permission to read file: \"~s\"!~n", [Filename]);
+file_error(eisdir, Filename) -> io:format("Error, \"~s\" is not a file!~n", [Filename]);
+file_error(enomem, Filename) -> io:format("Error, not enough memory to read file: \"~s\"~n", [Filename]).
+
 usage() ->
-   io:format("decomp v1.0.0~n"),
+   io:format("decomp v1.1.0~n"),
    io:format("Decompress a compressed State of Decay 2 save file.~n~n"),
    io:format("usage: decomp <compressed-filename> <decompressed-filename>~n"),
    halt(1).
